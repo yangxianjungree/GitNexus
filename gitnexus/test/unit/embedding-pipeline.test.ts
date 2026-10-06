@@ -7,6 +7,11 @@ import {
 } from '../../src/core/embeddings/embedding-pipeline.js';
 import { generateEmbeddingText } from '../../src/core/embeddings/text-generator.js';
 import type { EmbeddableNode, EmbeddingProgress } from '../../src/core/embeddings/types.js';
+import type {
+  EmbeddingChunkRecord,
+  StorageScope,
+  VectorStore,
+} from '../../src/core/storage/contracts.js';
 import {
   DEFAULT_EMBEDDING_CONFIG,
   EMBEDDABLE_LABELS,
@@ -368,6 +373,28 @@ describe('runEmbeddingPipeline incremental filter', () => {
     progressUpdates.push({ ...p });
   };
 
+  const makeVectorStore = () => {
+    const store: VectorStore & {
+      readonly upserted: EmbeddingChunkRecord[];
+      readonly deletedNodeScopes: Array<{ scope: StorageScope; nodeIds: string[] }>;
+    } = {
+      upserted: [],
+      deletedNodeScopes: [],
+      health: vi.fn().mockResolvedValue({ provider: 'postgresql', status: 'available' }),
+      upsertChunks: vi.fn(async (_scope, chunks) => {
+        store.upserted.push(...chunks);
+      }),
+      deleteChunks: vi.fn().mockResolvedValue(undefined),
+      deleteChunksForNodes: vi.fn(async (scope, nodeIds) => {
+        store.deletedNodeScopes.push({ scope, nodeIds: [...nodeIds] });
+      }),
+      getContentHashes: vi.fn().mockResolvedValue(new Map()),
+      searchNearest: vi.fn().mockResolvedValue([]),
+      countChunks: vi.fn().mockResolvedValue(1),
+    };
+    return store;
+  };
+
   it('falls back to text-bearing File nodes when a repo has no code symbols', async () => {
     mockEmbedderSetup();
 
@@ -438,6 +465,66 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(insertedNodeIds).toContain(functionNode.id);
     expect(insertedNodeIds).not.toContain(fileNode.id);
     expect(result.nodesProcessed).toBe(1);
+  });
+
+  it('writes vectors and stale-node deletes through the injected VectorStore', async () => {
+    mockEmbedderSetup();
+
+    const node = makeNode({ content: 'function foo() { return 42; }' });
+    const vectorStore = makeVectorStore();
+    const executeQuery = mockExecuteQuery([node]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      {},
+      undefined,
+      new Map([[node.id, 'stale-hash']]),
+      {
+        vectorStore,
+        storageScope: { repoId: 'repo-alpha', branchId: 'feature/vector' },
+      },
+    );
+
+    expect(vectorStore.deletedNodeScopes).toEqual([
+      {
+        scope: { repoId: 'repo-alpha', branchId: 'feature/vector' },
+        nodeIds: [node.id],
+      },
+    ]);
+    expect(vectorStore.upserted).toHaveLength(1);
+    expect(vectorStore.upserted[0]).toMatchObject({
+      nodeId: node.id,
+      chunkIndex: 0,
+      startLine: 0,
+      endLine: 0,
+    });
+    expect(stmtCalls.some((call) => call.cypher.includes('CREATE'))).toBe(false);
+    expect(vectorIndexMock).not.toHaveBeenCalled();
+  });
+
+  it('requires a repository and branch scope when a VectorStore is injected', async () => {
+    mockEmbedderSetup();
+    const vectorStore = makeVectorStore();
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await expect(
+      runEmbeddingPipeline(
+        mockExecuteQuery([makeNode()]),
+        mockExecuteWithReusedStatement(),
+        onProgress,
+        {},
+        undefined,
+        undefined,
+        { vectorStore },
+      ),
+    ).rejects.toThrow(/storageScope/);
   });
 
   it('skips unchanged nodes when hash matches', async () => {

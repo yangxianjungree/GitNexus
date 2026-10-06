@@ -47,6 +47,12 @@ import { escapeCypherString } from '../lbug/cypher-escape.js';
 import type { ExtensionInstallPolicy } from '../lbug/extension-loader.js';
 import { getExactScanLimit } from '../platform/capabilities.js';
 import { logger } from '../logger.js';
+import {
+  createStorageScope,
+  deterministicChunkId,
+  type StorageScope,
+  type VectorStore,
+} from '../storage/contracts.js';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -231,8 +237,46 @@ const queryFallbackFileNodes = async (
   }
 };
 
+export interface EmbeddingVectorStoreOptions {
+  /** Independent vector backend used instead of Ladybug's CodeEmbedding table. */
+  readonly vectorStore?: VectorStore;
+  /** Repository and branch identity applied to every vector operation. */
+  readonly storageScope?: StorageScope;
+}
+
+interface EmbeddingVectorStoreContext {
+  readonly store: VectorStore;
+  readonly scope: StorageScope;
+}
+
+const resolveVectorStoreContext = (
+  options?: EmbeddingVectorStoreOptions,
+): EmbeddingVectorStoreContext | undefined => {
+  if (!options?.vectorStore) return undefined;
+  if (!options.storageScope) {
+    throw new Error('storageScope is required when a vectorStore is injected');
+  }
+  return {
+    store: options.vectorStore,
+    scope: createStorageScope(options.storageScope.repoId, options.storageScope.branchId),
+  };
+};
+
+const ensureVectorStoreReady = async (context: EmbeddingVectorStoreContext): Promise<boolean> => {
+  try {
+    await context.store.countChunks(context.scope);
+    return true;
+  } catch (error) {
+    logger.warn(
+      { err: error },
+      'Vector store initialization failed; semantic search will use exact-scan fallback',
+    );
+    return false;
+  }
+};
+
 /**
- * Batch INSERT chunk-aware embeddings into CodeEmbedding table
+ * Batch INSERT chunk-aware embeddings into CodeEmbedding table or VectorStore.
  */
 export const batchInsertEmbeddings = async (
   executeWithReusedStatement: (
@@ -247,7 +291,26 @@ export const batchInsertEmbeddings = async (
     embedding: number[];
     contentHash?: string;
   }>,
+  vectorStoreOptions?: EmbeddingVectorStoreOptions,
 ): Promise<void> => {
+  if (updates.length === 0) return;
+  const vectorStoreContext = resolveVectorStoreContext(vectorStoreOptions);
+  if (vectorStoreContext) {
+    await vectorStoreContext.store.upsertChunks(
+      vectorStoreContext.scope,
+      updates.map((update) => ({
+        id: deterministicChunkId(update.nodeId, update.chunkIndex),
+        nodeId: update.nodeId,
+        chunkIndex: update.chunkIndex,
+        startLine: update.startLine,
+        endLine: update.endLine,
+        vector: update.embedding,
+        contentHash: update.contentHash ?? STALE_HASH_SENTINEL,
+      })),
+    );
+    return;
+  }
+
   const paramsList = updates.map((u) => ({
     id: `${u.nodeId}:${u.chunkIndex}`,
     nodeId: u.nodeId,
@@ -257,8 +320,6 @@ export const batchInsertEmbeddings = async (
     embedding: u.embedding,
     contentHash: u.contentHash ?? STALE_HASH_SENTINEL,
   }));
-  if (paramsList.length === 0) return;
-
   await executeWithReusedStatement(
     `MATCH (e:${EMBEDDING_TABLE_NAME} {id: $id}) DELETE e`,
     paramsList.map(({ id }) => ({ id })),
@@ -474,6 +535,8 @@ export interface EmbeddingPipelineOptions {
   signal?: AbortSignal;
   checkpointEveryNodes?: number;
   forceReembedNodeIds?: ReadonlySet<string>;
+  vectorStore?: VectorStore;
+  storageScope?: StorageScope;
   onCheckpointWindowStart?: (window: EmbeddingPipelineCheckpointWindow) => Promise<void>;
   onCheckpoint?: (checkpoint: EmbeddingPipelineCheckpoint) => Promise<void>;
 }
@@ -497,8 +560,19 @@ const deleteStaleEmbeddingRows = async (
     paramsList: Array<Record<string, any>>,
   ) => Promise<void>,
   nodeIds: string[],
+  vectorStoreOptions?: EmbeddingVectorStoreOptions,
 ): Promise<void> => {
   if (nodeIds.length === 0) return;
+  const vectorStoreContext = resolveVectorStoreContext(vectorStoreOptions);
+  if (vectorStoreContext) {
+    try {
+      await vectorStoreContext.store.deleteChunksForNodes(vectorStoreContext.scope, nodeIds);
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`[embed] Failed to delete stale vector rows: ${message}`, { cause: error });
+    }
+  }
   try {
     await executeWithReusedStatement(
       `MATCH (e:${EMBEDDING_TABLE_NAME} {nodeId: $nodeId}) DELETE e`,
@@ -539,6 +613,11 @@ export const runEmbeddingPipeline = async (
   pipelineOptions: EmbeddingPipelineOptions = {},
 ): Promise<EmbeddingPipelineResult> => {
   const finalConfig = resolveEmbeddingConfig(config);
+  const vectorStoreOptions: EmbeddingVectorStoreOptions = {
+    vectorStore: pipelineOptions.vectorStore,
+    storageScope: pipelineOptions.storageScope,
+  };
+  const vectorStoreContext = resolveVectorStoreContext(vectorStoreOptions);
   let totalChunks = 0;
   const checkpointEveryNodes = pipelineOptions.checkpointEveryNodes ?? 5_000;
   if (!Number.isSafeInteger(checkpointEveryNodes) || checkpointEveryNodes <= 0) {
@@ -548,7 +627,7 @@ export const runEmbeddingPipeline = async (
 
   try {
     throwIfCancelled();
-    const vectorAvailable = await ensureVectorExtensionAvailable();
+    const vectorAvailable = vectorStoreContext ? true : await ensureVectorExtensionAvailable();
     throwIfCancelled();
     if (!vectorAvailable) {
       logger.warn(vectorUnavailableMessage);
@@ -630,7 +709,11 @@ export const runEmbeddingPipeline = async (
       const removedPendingNodeIds = [...forceReembedNodeIds].filter(
         (nodeId) => !embeddableNodeIds.has(nodeId),
       );
-      await deleteStaleEmbeddingRows(executeWithReusedStatement, removedPendingNodeIds);
+      await deleteStaleEmbeddingRows(
+        executeWithReusedStatement,
+        removedPendingNodeIds,
+        vectorStoreOptions,
+      );
       throwIfCancelled();
     }
 
@@ -645,7 +728,9 @@ export const runEmbeddingPipeline = async (
       // Ensure the vector index exists even when no new nodes need embedding.
       // A prior crash or first-time incremental run may have left CodeEmbedding
       // rows without ever reaching index creation.
-      const vectorIndexReady = await buildVectorIndex();
+      const vectorIndexReady = vectorStoreContext
+        ? await ensureVectorStoreReady(vectorStoreContext)
+        : await buildVectorIndex();
 
       onProgress({
         phase: 'ready',
@@ -807,7 +892,7 @@ export const runEmbeddingPipeline = async (
       // so an interrupted re-embed loses at most one batch (not the whole index).
       // Preserves Kuzu's required DELETE-before-INSERT for vector-indexed rows.
       const batchStaleIds = batch.filter((n) => staleNodeIds.has(n.id)).map((n) => n.id);
-      await deleteStaleEmbeddingRows(executeWithReusedStatement, batchStaleIds);
+      await deleteStaleEmbeddingRows(executeWithReusedStatement, batchStaleIds, vectorStoreOptions);
       throwIfCancelled();
 
       // Embed chunk texts in sub-batches to control memory
@@ -881,7 +966,7 @@ export const runEmbeddingPipeline = async (
           embedding: embeddingToArray(embeddings[i]),
         }));
 
-        await batchInsertEmbeddings(executeWithReusedStatement, dbUpdates);
+        await batchInsertEmbeddings(executeWithReusedStatement, dbUpdates, vectorStoreOptions);
         throwIfCancelled();
       }
 
@@ -897,7 +982,11 @@ export const runEmbeddingPipeline = async (
       // matching the U6 / KTD7 delete-window rationale above.
       if (batchFailedNodeIds.size > 0) {
         try {
-          await deleteStaleEmbeddingRows(executeWithReusedStatement, [...batchFailedNodeIds]);
+          await deleteStaleEmbeddingRows(
+            executeWithReusedStatement,
+            [...batchFailedNodeIds],
+            vectorStoreOptions,
+          );
         } catch (cleanupErr) {
           // A failing cleanup DELETE must never swallow a pending abort: that
           // error names the actual defect (the endpoint), while a busy or
@@ -956,7 +1045,7 @@ export const runEmbeddingPipeline = async (
       logger.info('📇 Creating vector index...');
     }
 
-    const vectorIndexReady = await buildVectorIndex();
+    const vectorIndexReady = vectorStoreContext ? true : await buildVectorIndex();
 
     onProgress({
       phase: 'ready',
