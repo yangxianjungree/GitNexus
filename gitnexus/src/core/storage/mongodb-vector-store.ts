@@ -23,6 +23,17 @@ interface MongoEmbeddingChunk extends Document {
   readonly contentHash: string;
 }
 
+interface MongoSearchIndexState {
+  readonly name?: string;
+  readonly status?: string;
+  readonly queryable?: boolean;
+}
+
+const SEARCH_INDEX_READY_TIMEOUT_MS = 30_000;
+const SEARCH_INDEX_POLL_INTERVAL_MS = 100;
+const VECTOR_QUERY_RETRY_TIMEOUT_MS = 5_000;
+const VECTOR_QUERY_RETRY_INTERVAL_MS = 100;
+
 const vectorLiteral = (vector: readonly number[]): number[] => {
   if (vector.length === 0 || vector.some((value) => !Number.isFinite(value))) {
     throw new Error('Embedding vectors must contain finite numeric values');
@@ -102,24 +113,48 @@ export class MongoVectorStore implements VectorStore {
     });
     await collection.createIndex({ repoId: 1, branchId: 1, nodeId: 1 });
 
-    const searchIndexes = await collection.listSearchIndexes(this.indexName).toArray();
-    if (searchIndexes.some((index) => index.name === this.indexName)) return;
-    await collection.createSearchIndex({
-      name: this.indexName,
-      type: 'vectorSearch',
-      definition: {
-        fields: [
-          {
-            type: 'vector',
-            path: 'embedding',
-            numDimensions: this.dimensions,
-            similarity: 'cosine',
-          },
-          { type: 'filter', path: 'repoId' },
-          { type: 'filter', path: 'branchId' },
-        ],
-      },
-    });
+    const searchIndexes = (await collection
+      .listSearchIndexes(this.indexName)
+      .toArray()) as MongoSearchIndexState[];
+    if (!searchIndexes.some((index) => index.name === this.indexName)) {
+      await collection.createSearchIndex({
+        name: this.indexName,
+        type: 'vectorSearch',
+        definition: {
+          fields: [
+            {
+              type: 'vector',
+              path: 'embedding',
+              numDimensions: this.dimensions,
+              similarity: 'cosine',
+            },
+            { type: 'filter', path: 'repoId' },
+            { type: 'filter', path: 'branchId' },
+          ],
+        },
+      });
+    }
+    await this.waitForSearchIndex(collection);
+  }
+
+  private async waitForSearchIndex(collection: Collection<MongoEmbeddingChunk>): Promise<void> {
+    const deadline = Date.now() + SEARCH_INDEX_READY_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const indexes = (await collection
+        .listSearchIndexes(this.indexName)
+        .toArray()) as MongoSearchIndexState[];
+      const index = indexes.find((candidate) => candidate.name === this.indexName);
+      if (
+        index &&
+        (index.queryable === true ||
+          index.status === 'READY' ||
+          (index.queryable === undefined && index.status === undefined))
+      ) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, SEARCH_INDEX_POLL_INTERVAL_MS));
+    }
+    throw new Error(`MongoDB vector search index "${this.indexName}" did not become queryable`);
   }
 
   async health(): Promise<StoreHealth> {
@@ -257,31 +292,42 @@ export class MongoVectorStore implements VectorStore {
     }
     await this.initialize();
     const candidates = Math.max(options.limit * 10, 100);
-    const rows = await (
-      await this.getCollection()
-    )
-      .aggregate<MongoEmbeddingChunk & { readonly score?: number }>([
-        {
-          $vectorSearch: {
-            index: this.indexName,
-            path: 'embedding',
-            queryVector: vectorLiteral(vector),
-            numCandidates: candidates,
-            limit: options.limit,
-            filter: { repoId: scope.repoId, branchId: scope.branchId },
-          },
+    const collection = await this.getCollection();
+    const pipeline = [
+      {
+        $vectorSearch: {
+          index: this.indexName,
+          path: 'embedding',
+          queryVector: vectorLiteral(vector),
+          numCandidates: candidates,
+          limit: options.limit,
+          filter: { repoId: scope.repoId, branchId: scope.branchId },
         },
-        {
-          $project: {
-            nodeId: 1,
-            chunkIndex: 1,
-            startLine: 1,
-            endLine: 1,
-            score: { $meta: 'vectorSearchScore' },
-          },
+      },
+      {
+        $project: {
+          nodeId: 1,
+          chunkIndex: 1,
+          startLine: 1,
+          endLine: 1,
+          score: { $meta: 'vectorSearchScore' },
         },
-      ])
-      .toArray();
+      },
+    ];
+    let rows: (MongoEmbeddingChunk & { readonly score?: number })[] = [];
+    const deadline = Date.now() + VECTOR_QUERY_RETRY_TIMEOUT_MS;
+    do {
+      rows = await collection
+        .aggregate<MongoEmbeddingChunk & { readonly score?: number }>(pipeline)
+        .toArray();
+      if (rows.length > 0 || Date.now() >= deadline) break;
+      const scopedCount = await collection.countDocuments({
+        repoId: scope.repoId,
+        branchId: scope.branchId,
+      });
+      if (scopedCount === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, VECTOR_QUERY_RETRY_INTERVAL_MS));
+    } while (true);
     return rows
       .map((row) => ({
         nodeId: row.nodeId,
