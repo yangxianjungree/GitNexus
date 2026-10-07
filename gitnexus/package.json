@@ -85,6 +85,7 @@
     "js-yaml": "^5.0.0",
     "jsonc-parser": "^3.3.1",
     "mnemonist": "^0.40.3",
+    "mongodb": "^7.7.0",
     "neo4j-driver": "6.2.0",
     "node-addon-api": "^8.0.0",
     "node-gyp-build": "^4.8.0",

@@ -71,4 +71,29 @@ describe('split storage contracts', () => {
     expect(isSplitStorageEnabled({ GITNEXUS_STORAGE_MODE: 'ladybug' })).toBe(false);
     expect(isSplitStorageEnabled({ GITNEXUS_STORAGE_MODE: ' SPLIT ' })).toBe(true);
   });
+
+  it('resolves TuGraph and MongoDB endpoints without exposing credentials', () => {
+    const config = resolveStorageConfig({
+      GITNEXUS_GRAPH_PROVIDER: 'tugraph',
+      GITNEXUS_TUGRAPH_URI: 'http://graph.local:7071',
+      GITNEXUS_TUGRAPH_USERNAME: 'admin',
+      GITNEXUS_TUGRAPH_PASSWORD: 'graph-secret',
+      GITNEXUS_TUGRAPH_GRAPH: 'default',
+      GITNEXUS_VECTOR_PROVIDER: 'mongodb',
+      GITNEXUS_MONGODB_URL: 'mongodb://vector-user:vector-secret@vector.local:27017',
+      GITNEXUS_MONGODB_DATABASE: 'gitnexus',
+    });
+
+    expect(config.graph).toMatchObject({ provider: 'tugraph', database: 'default' });
+    expect(config.vector).toMatchObject({
+      provider: 'mongodb',
+      database: 'gitnexus',
+      collection: 'embedding_chunks',
+    });
+    const diagnostics = JSON.stringify(storageConfigDiagnostics(config));
+    expect(diagnostics).toContain('graph.local:7071');
+    expect(diagnostics).toContain('vector.local:27017');
+    expect(diagnostics).not.toContain('graph-secret');
+    expect(diagnostics).not.toContain('vector-secret');
+  });
 });

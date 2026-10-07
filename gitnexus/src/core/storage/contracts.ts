@@ -78,8 +78,11 @@ export interface TextSearchHit {
 
 export type StoreHealthStatus = 'available' | 'degraded' | 'unavailable';
 
+export type GraphProviderName = 'neo4j' | 'tugraph';
+export type VectorProviderName = 'postgresql' | 'mongodb';
+
 export interface StoreHealth {
-  readonly provider: 'neo4j' | 'postgresql';
+  readonly provider: GraphProviderName | VectorProviderName;
   readonly status: StoreHealthStatus;
   /** Safe, user-facing explanation. It must never include connection credentials. */
   readonly message?: string;
