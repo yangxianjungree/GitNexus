@@ -23,6 +23,15 @@ describe('TuGraphGraphStore', () => {
         if (url.endsWith('/login')) {
           return new Response(JSON.stringify({ jwt: 'jwt-token' }), { status: 200 });
         }
+        const body = JSON.parse(String(init?.body)) as { script?: string };
+        if (body.script === 'CALL db.vertexLabels()' || body.script === 'CALL db.edgeLabels()') {
+          return new Response(JSON.stringify({ header: [{ name: 'label' }], result: [] }), {
+            status: 200,
+          });
+        }
+        if (body.script?.startsWith("CALL db.createLabel('")) {
+          return new Response(JSON.stringify({ header: [], result: [] }), { status: 200 });
+        }
         return new Response(
           JSON.stringify({
             header: [{ name: 'id' }, { name: 'count' }],
@@ -41,13 +50,46 @@ describe('TuGraphGraphStore', () => {
     );
 
     expect(rows).toEqual([{ id: 'Function:src/a.ts:run', count: 3 }]);
-    expect(calls).toHaveLength(2);
-    expect(calls[1].url).toBe('http://localhost:7071/cypher');
-    expect(calls[1].init?.headers).toMatchObject({ authorization: 'Bearer jwt-token' });
-    expect(JSON.parse(String(calls[1].init?.body))).toMatchObject({
+    expect(calls).toHaveLength(6);
+    const queryCall = calls.at(-1);
+    expect(queryCall).toBeDefined();
+    if (!queryCall) return;
+    expect(queryCall.url).toBe('http://localhost:7071/cypher');
+    expect(queryCall.init?.headers).toMatchObject({ authorization: 'Bearer jwt-token' });
+    expect(JSON.parse(String(queryCall.init?.body))).toMatchObject({
       graph: 'default',
       parameters: { $repoId: 'repo-alpha', $branchId: 'feature/tugraph', $limit: 1 },
     });
+  });
+
+  it('uses one strong-schema node label and stores the semantic kind as a property', async () => {
+    const scripts: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.endsWith('/login')) return new Response(JSON.stringify({ jwt: 'jwt-token' }));
+        const body = JSON.parse(String(init?.body)) as { script?: string };
+        scripts.push(body.script ?? '');
+        if (body.script === 'CALL db.vertexLabels()' || body.script === 'CALL db.edgeLabels()') {
+          return new Response(JSON.stringify({ header: [{ name: 'label' }], result: [] }));
+        }
+        return new Response(JSON.stringify({ header: [{ name: 'written' }], result: [[1]] }));
+      }),
+    );
+
+    const store = new TuGraphGraphStore(config);
+    await store.upsertNodes(scope, [
+      {
+        id: 'Function:src/a.ts:run',
+        label: 'Function',
+        properties: { name: 'run', filePath: 'src/a.ts', startLine: 1 },
+      },
+    ]);
+
+    const write = scripts.find((script) => script.includes('MERGE (n:GitNexusNode'));
+    expect(write).toContain('MERGE (n:GitNexusNode {_scopeId:');
+    expect(write).toContain("n.kind = 'Function'");
+    expect(write).not.toContain(':`Function`');
   });
 
   it('rejects graph queries without repository and branch predicates before contacting TuGraph', async () => {

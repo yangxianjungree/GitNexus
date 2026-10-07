@@ -9,6 +9,8 @@ import {
 import type { StorageConfig } from './config.js';
 
 const GRAPH_BATCH_SIZE = 500;
+const VERTEX_LABEL = 'GitNexusNode';
+const EDGE_LABEL = 'CodeRelation';
 
 const chunksOf = <T>(items: readonly T[], size: number): T[][] => {
   const chunks: T[][] = [];
@@ -37,29 +39,115 @@ const normalizeValue = (value: unknown): unknown => {
 };
 
 const withoutStorageMetadata = (value: unknown): Record<string, unknown> => {
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value) as unknown;
+    } catch {
+      return {};
+    }
+  }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const {
+    _LABEL_: _label,
+    _VID_: _vid,
     id: _id,
     repoId: _repoId,
     branchId: _branchId,
     kind: _kind,
+    propertiesJson,
     ...properties
   } = value as Record<string, unknown>;
-  return properties;
+  let stored: Record<string, unknown> = {};
+  if (typeof propertiesJson === 'string' && propertiesJson.length > 0) {
+    try {
+      const parsed: unknown = JSON.parse(propertiesJson);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        stored = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Keep the fixed schema fields when an older/corrupt JSON payload is found.
+    }
+  }
+  return { ...properties, ...stored };
 };
 
-const toProperties = (
+const scopedNodeId = (scope: StorageScope, id: string): string =>
+  `${encodeURIComponent(scope.repoId)}:${encodeURIComponent(scope.branchId)}:${encodeURIComponent(id)}`;
+
+const asOptionalString = (value: unknown): string | null =>
+  typeof value === 'string' ? value : null;
+
+const asOptionalInt = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isSafeInteger(value) ? value : null;
+
+const asOptionalBoolean = (value: unknown): boolean | null =>
+  typeof value === 'boolean' ? value : null;
+
+const cypherLiteral = (value: unknown): string => {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value === 'string') {
+    return `'${value
+      .replaceAll('\\', '\\\\')
+      .replaceAll("'", "\\'")
+      .replaceAll('\r', '\\r')
+      .replaceAll('\n', '\\n')}'`;
+  }
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  throw new Error(`TuGraph cannot encode value of type ${typeof value} as a Cypher literal`);
+};
+
+const cypherStringList = (values: readonly string[]): string =>
+  `[${values.map(cypherLiteral).join(', ')}]`;
+
+const toNodeProperties = (
   scope: StorageScope,
   id: string,
   kind: string,
   properties: Readonly<Record<string, unknown>>,
 ): Record<string, unknown> => ({
-  ...properties,
+  _scopeId: scopedNodeId(scope, id),
   id,
   repoId: scope.repoId,
   branchId: scope.branchId,
   kind,
+  name: asOptionalString(properties.name),
+  filePath: asOptionalString(properties.filePath),
+  content: asOptionalString(properties.content),
+  startLine: asOptionalInt(properties.startLine),
+  endLine: asOptionalInt(properties.endLine),
+  isExported: asOptionalBoolean(properties.isExported),
+  description: asOptionalString(properties.description),
+  propertiesJson: JSON.stringify(normalizeValue(properties)),
 });
+
+const toEdgeProperties = (
+  scope: StorageScope,
+  id: string,
+  type: string,
+  properties: Readonly<Record<string, unknown>>,
+): Record<string, unknown> => ({
+  id,
+  repoId: scope.repoId,
+  branchId: scope.branchId,
+  sourceId: properties.sourceId ?? null,
+  targetId: properties.targetId ?? null,
+  type,
+  propertiesJson: JSON.stringify(normalizeValue(properties)),
+});
+
+const schemaStatements = {
+  vertex: `CALL db.createLabel('vertex', '${VERTEX_LABEL}', '_scopeId',
+    ['_scopeId', 'string', false], ['id', 'string', true], ['repoId', 'string', true],
+    ['branchId', 'string', true], ['kind', 'string', true], ['name', 'string', true],
+    ['filePath', 'string', true], ['content', 'string', true], ['startLine', 'int64', true],
+    ['endLine', 'int64', true], ['isExported', 'bool', true], ['description', 'string', true],
+    ['propertiesJson', 'string', true])`,
+  edge: `CALL db.createLabel('edge', '${EDGE_LABEL}', '[]',
+    ['id', 'string', true], ['repoId', 'string', true], ['branchId', 'string', true],
+    ['sourceId', 'string', true], ['targetId', 'string', true], ['type', 'string', true],
+    ['propertiesJson', 'string', true])`,
+} as const;
 
 const translateGraphQuery = (statement: string): string =>
   statement
@@ -79,6 +167,7 @@ export class TuGraphGraphStore implements GraphStore {
   private readonly password: string;
   private readonly graph: string;
   private tokenPromise: Promise<string> | undefined;
+  private schemaReady: Promise<void> | undefined;
 
   constructor(config: StorageConfig['graph']) {
     this.baseUrl = config.uri.replace(/\/$/, '');
@@ -88,7 +177,27 @@ export class TuGraphGraphStore implements GraphStore {
   }
 
   async initialize(): Promise<void> {
+    this.schemaReady ??= this.createSchema();
+    try {
+      await this.schemaReady;
+    } catch (error) {
+      this.schemaReady = undefined;
+      throw error;
+    }
+  }
+
+  private async createSchema(): Promise<void> {
     await this.login();
+    const [vertexLabels, edgeLabels] = await Promise.all([
+      this.callCypher('CALL db.vertexLabels()'),
+      this.callCypher('CALL db.edgeLabels()'),
+    ]);
+    if (!vertexLabels.some((row) => row.label === VERTEX_LABEL)) {
+      await this.callCypher(schemaStatements.vertex);
+    }
+    if (!edgeLabels.some((row) => row.label === EDGE_LABEL)) {
+      await this.callCypher(schemaStatements.edge);
+    }
   }
 
   private async login(): Promise<string> {
@@ -198,22 +307,18 @@ export class TuGraphGraphStore implements GraphStore {
     if (grouped.size === 0) return;
     await this.initialize();
     for (const [label, rows] of grouped) {
-      const query = `
-        UNWIND $rows AS row
-        MERGE (n:GitNexusNode:\`${label}\` {
-          repoId: $repoId, branchId: $branchId, id: row.id
-        })
-        SET n = row.properties
-      `;
       for (const batch of chunksOf(rows, GRAPH_BATCH_SIZE)) {
-        await this.callCypher(query, {
-          repoId: scope.repoId,
-          branchId: scope.branchId,
-          rows: batch.map((node) => ({
-            id: node.id,
-            properties: toProperties(scope, node.id, label, node.properties),
-          })),
-        });
+        for (const node of batch) {
+          const properties = toNodeProperties(scope, node.id, label, node.properties);
+          const assignments = Object.entries(properties)
+            .filter(([, value]) => value !== null && value !== undefined)
+            .map(([key, value]) => `n.${key} = ${cypherLiteral(value)}`)
+            .join(',\n          ');
+          await this.callCypher(`
+            MERGE (n:${VERTEX_LABEL} {_scopeId: ${cypherLiteral(properties._scopeId)}})
+            SET ${assignments}
+          `);
+        }
       }
     }
   }
@@ -225,37 +330,35 @@ export class TuGraphGraphStore implements GraphStore {
     scope = createStorageScope(scope.repoId, scope.branchId);
     if (relationships.length === 0) return;
     await this.initialize();
-    const query = `
-      UNWIND $rows AS row
-      MATCH (source:GitNexusNode {repoId: $repoId, branchId: $branchId, id: row.sourceId})
-      MATCH (target:GitNexusNode {repoId: $repoId, branchId: $branchId, id: row.targetId})
-      MERGE (source)-[r:CodeRelation {
-        repoId: $repoId, branchId: $branchId, id: row.id
-      }]->(target)
-      SET r = row.properties
-      RETURN count(r) AS written
-    `;
     for (const batch of chunksOf(relationships, GRAPH_BATCH_SIZE)) {
-      const rows = await this.callCypher(query, {
-        repoId: scope.repoId,
-        branchId: scope.branchId,
-        rows: batch.map((relationship) => ({
-          id: relationship.id,
+      for (const relationship of batch) {
+        const properties = toEdgeProperties(scope, relationship.id, relationship.type, {
+          ...relationship.properties,
           sourceId: relationship.sourceId,
           targetId: relationship.targetId,
-          properties: toProperties(
-            scope,
-            relationship.id,
-            relationship.type,
-            relationship.properties,
-          ),
-        })),
-      });
-      const written = Number(rows[0]?.written ?? 0);
-      if (written !== batch.length) {
-        throw new Error(
-          `TuGraph stored ${written} of ${batch.length} relationships; one or more scoped endpoints are missing`,
-        );
+        });
+        const propertyMap = Object.entries(properties)
+          .map(([key, value]) => `${key}: ${cypherLiteral(value)}`)
+          .join(', ');
+        await this.callCypher(`
+          MATCH ()-[old:${EDGE_LABEL}]->()
+          WHERE old.id = ${cypherLiteral(relationship.id)}
+            AND old.repoId = ${cypherLiteral(scope.repoId)}
+            AND old.branchId = ${cypherLiteral(scope.branchId)}
+          DELETE old
+        `);
+        const rows = await this.callCypher(`
+          MATCH (source:${VERTEX_LABEL} {_scopeId: ${cypherLiteral(scopedNodeId(scope, relationship.sourceId))}}),
+                (target:${VERTEX_LABEL} {_scopeId: ${cypherLiteral(scopedNodeId(scope, relationship.targetId))}})
+          CREATE (source)-[r:${EDGE_LABEL} {${propertyMap}}]->(target)
+          RETURN count(r) AS written
+        `);
+        const written = Number(rows[0]?.written ?? 0);
+        if (written !== 1) {
+          throw new Error(
+            `TuGraph stored ${written} relationship(s) for ${relationship.id}; one or more scoped endpoints are missing`,
+          );
+        }
       }
     }
   }
@@ -265,15 +368,14 @@ export class TuGraphGraphStore implements GraphStore {
     if (ids.length === 0) return [];
     const rows = await this.query(
       scope,
-      `MATCH (n:GitNexusNode {repoId: $repoId, branchId: $branchId})
-       WHERE n.id IN $ids
-       RETURN n.id AS id, n.kind AS label, properties(n) AS properties`,
-      { ids },
+      `MATCH (n:${VERTEX_LABEL})
+       WHERE n.repoId = $repoId AND n.branchId = $branchId AND n.id IN ${cypherStringList(ids)}
+       RETURN n.id AS id, n.kind AS label, n.propertiesJson AS propertiesJson`,
     );
     return rows.map((row) => ({
       id: String(row.id),
       label: String(row.label),
-      properties: withoutStorageMetadata(row.properties),
+      properties: withoutStorageMetadata({ propertiesJson: row.propertiesJson }),
     }));
   }
 
@@ -281,7 +383,21 @@ export class TuGraphGraphStore implements GraphStore {
     scope = createStorageScope(scope.repoId, scope.branchId);
     await this.query(
       scope,
-      'MATCH (n:GitNexusNode {repoId: $repoId, branchId: $branchId}) DETACH DELETE n',
+      `MATCH (n:${VERTEX_LABEL})-[r:${EDGE_LABEL}]->()
+       WHERE n.repoId = $repoId AND n.branchId = $branchId
+       DELETE r`,
+    );
+    await this.query(
+      scope,
+      `MATCH ()-[r:${EDGE_LABEL}]->(n:${VERTEX_LABEL})
+       WHERE n.repoId = $repoId AND n.branchId = $branchId
+       DELETE r`,
+    );
+    await this.query(
+      scope,
+      `MATCH (n:${VERTEX_LABEL})
+       WHERE n.repoId = $repoId AND n.branchId = $branchId
+       DELETE n`,
     );
   }
 
@@ -291,10 +407,21 @@ export class TuGraphGraphStore implements GraphStore {
     for (const batch of chunksOf(ids, GRAPH_BATCH_SIZE)) {
       await this.query(
         scope,
-        `MATCH (n:GitNexusNode {repoId: $repoId, branchId: $branchId})
-         WHERE n.id IN $ids
-         DETACH DELETE n`,
-        { ids: batch },
+        `MATCH (n:${VERTEX_LABEL})-[r:${EDGE_LABEL}]->()
+         WHERE n.repoId = $repoId AND n.branchId = $branchId AND n.id IN ${cypherStringList(batch)}
+         DELETE r`,
+      );
+      await this.query(
+        scope,
+        `MATCH ()-[r:${EDGE_LABEL}]->(n:${VERTEX_LABEL})
+         WHERE n.repoId = $repoId AND n.branchId = $branchId AND n.id IN ${cypherStringList(batch)}
+         DELETE r`,
+      );
+      await this.query(
+        scope,
+        `MATCH (n:${VERTEX_LABEL})
+         WHERE n.repoId = $repoId AND n.branchId = $branchId AND n.id IN ${cypherStringList(batch)}
+         DELETE n`,
       );
     }
   }

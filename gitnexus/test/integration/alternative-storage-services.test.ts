@@ -78,10 +78,10 @@ describe.skipIf(!enabled)('alternative graph and vector services', () => {
 
       const graphRows = await providers.graph.query(
         first,
-        `MATCH (source:GitNexusNode {repoId: $repoId, branchId: $branchId, id: $sourceId})
-         MATCH (target:GitNexusNode {repoId: $repoId, branchId: $branchId, id: $targetId})
-         MATCH (source)-[r:CodeRelation]->(target)
-         WHERE r.type = $type
+        `MATCH (source:GitNexusNode)-[r:CodeRelation]->(target:GitNexusNode)
+         WHERE source.repoId = $repoId AND source.branchId = $branchId AND source.id = $sourceId
+           AND target.repoId = $repoId AND target.branchId = $branchId AND target.id = $targetId
+           AND r.type = $type
          RETURN source.id AS sourceId, target.id AS targetId, r.type AS type`,
         { sourceId: nodes[0].id, targetId: nodes[1].id, type: 'CALLS' },
       );
