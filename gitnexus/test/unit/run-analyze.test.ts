@@ -25,6 +25,11 @@ import { isDetectRejectWarning } from '../helpers/detect-reject-warning.js';
 import { readEmbeddingNodeIds } from '../helpers/embedding-seed.js';
 import { getIndexIncompleteReasons } from '../../src/core/index-freshness.js';
 import { CLASS_FRAMEWORK_ANNOTATIONS_FEATURE } from '../../src/core/analysis-features.js';
+import {
+  registerGraphStoreProvider,
+  registerVectorStoreProvider,
+} from '../../src/core/storage/providers.js';
+import type { GraphStore, VectorStore } from '../../src/core/storage/contracts.js';
 
 const CURRENT_ANALYSIS_FEATURES = {
   [CLASS_FRAMEWORK_ANNOTATIONS_FEATURE.id]: CLASS_FRAMEWORK_ANNOTATIONS_FEATURE.version,
@@ -53,6 +58,113 @@ describe('run-analyze module', () => {
     const mod = await import('../../src/core/run-analyze.js');
     expect(mod.PHASE_LABELS).toBeDefined();
     expect(mod.PHASE_LABELS.parsing).toBe('Parsing code');
+  });
+
+  it('does not take the same-commit fast path after only the vector provider changes', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-vector-provider-switch-');
+    const savedEnv = {
+      mode: process.env.GITNEXUS_STORAGE_MODE,
+      graph: process.env.GITNEXUS_GRAPH_PROVIDER,
+      graphUri: process.env.GITNEXUS_GRAPH_URI,
+      vector: process.env.GITNEXUS_VECTOR_PROVIDER,
+      vectorUri: process.env.GITNEXUS_VECTOR_URI,
+    };
+    const graph = {
+      queryCapabilities: { gitnexusCypher: 'v1', rawQueryLanguage: 'test-cypher' },
+      query: async () => [],
+      health: async () => ({ provider: 'test-graph-switch', status: 'available' as const }),
+      close: async () => {},
+    } as unknown as GraphStore & {
+      queryCapabilities: { gitnexusCypher: 'v1'; rawQueryLanguage: string };
+      close(): Promise<void>;
+    };
+    const vector = {
+      health: async () => ({ provider: 'custom-vector', status: 'available' as const }),
+      deleteAllChunks: async () => {
+        throw new Error('split vector reset reached');
+      },
+      close: async () => {},
+    } as unknown as VectorStore & { close(): Promise<void> };
+    const unregisterGraph = registerGraphStoreProvider('test-graph-switch', () => graph);
+    const unregisterVector = registerVectorStoreProvider('test-vector-switch', () => vector);
+
+    const restore = (key: string, value: string | undefined) => {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    };
+    try {
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+      const currentCommit = execSync('git rev-parse HEAD', {
+        cwd: tmpRepo.dbPath,
+        encoding: 'utf-8',
+      }).trim();
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: currentCommit,
+        indexedAt: new Date().toISOString(),
+        schemaFingerprint: SCHEMA_FINGERPRINT,
+        analysisFeatures: CURRENT_ANALYSIS_FEATURES,
+        runnerIdentity: currentRunnerIdentity(),
+        capabilities: {
+          graph: { provider: 'neo4j', status: 'available' },
+          fts: { provider: 'ladybugdb-fts', status: 'available' },
+          vectorSearch: {
+            provider: 'postgresql-pgvector',
+            status: 'vector-index',
+            exactScanLimit: 10_000,
+          },
+        },
+        stats: { embeddings: 42 },
+        splitStorage: {
+          state: 'ready',
+          graphProvider: 'test-graph-switch',
+          vectorProvider: 'postgresql',
+        },
+      });
+
+      process.env.GITNEXUS_STORAGE_MODE = 'split';
+      process.env.GITNEXUS_GRAPH_PROVIDER = 'test-graph-switch';
+      process.env.GITNEXUS_GRAPH_URI = 'test+tcp://graph.local:7610';
+      process.env.GITNEXUS_VECTOR_PROVIDER = 'test-vector-switch';
+      process.env.GITNEXUS_VECTOR_URI = 'test+tcp://vector.local:7810';
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      const logs: string[] = [];
+      await expect(
+        runFullAnalysis(
+          tmpRepo.dbPath,
+          {},
+          { onProgress: () => {}, onLog: (message) => logs.push(message) },
+        ),
+      ).rejects.toThrow('split vector reset reached');
+      expect(logs).toContainEqual(
+        expect.stringContaining('regenerating embeddings recorded by the previous index'),
+      );
+
+      const failedMeta = await loadMeta(storagePath);
+      expect(failedMeta).toMatchObject({
+        lastCommit: '',
+        splitStorage: {
+          state: 'failed',
+          graphProvider: 'test-graph-switch',
+          vectorProvider: 'test-vector-switch',
+        },
+      });
+    } finally {
+      restore('GITNEXUS_STORAGE_MODE', savedEnv.mode);
+      restore('GITNEXUS_GRAPH_PROVIDER', savedEnv.graph);
+      restore('GITNEXUS_GRAPH_URI', savedEnv.graphUri);
+      restore('GITNEXUS_VECTOR_PROVIDER', savedEnv.vector);
+      restore('GITNEXUS_VECTOR_URI', savedEnv.vectorUri);
+      unregisterVector();
+      unregisterGraph();
+      await tmpRepo.cleanup();
+    }
   });
 
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {

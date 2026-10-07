@@ -56,6 +56,11 @@ describe.skipIf(!enabled)('split storage real services', () => {
     };
 
     try {
+      expect(providers.identity).toEqual({ graph: 'neo4j', vector: 'postgresql' });
+      expect(providers.graph.queryCapabilities).toEqual({
+        gitnexusCypher: 'v1',
+        rawQueryLanguage: 'neo4j-cypher',
+      });
       await expect(providers.graph.health()).resolves.toMatchObject({
         provider: 'neo4j',
         status: 'available',

@@ -3,7 +3,7 @@ import {
   createStorageScope,
   type GraphNodeRecord,
   type GraphRelationshipRecord,
-  type GraphStore,
+  type QueryableGraphStore,
   type StorageScope,
   type StoreHealth,
 } from './contracts.js';
@@ -110,7 +110,12 @@ const toNeo4jProperties = (value: Readonly<Record<string, unknown>>): Record<str
  * Neo4j adapter for the code graph. Each node and relationship carries the
  * repository and branch that own it; all reads and deletes repeat that scope.
  */
-export class Neo4jGraphStore implements GraphStore {
+export class Neo4jGraphStore implements QueryableGraphStore {
+  readonly queryCapabilities = {
+    gitnexusCypher: 'v1',
+    rawQueryLanguage: 'neo4j-cypher',
+  } as const;
+
   private readonly driver: Driver;
   private readonly database: string;
   private schemaReady: Promise<void> | undefined;

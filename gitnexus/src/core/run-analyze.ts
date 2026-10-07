@@ -298,6 +298,10 @@ import {
   isSplitStorageEnabled,
   type SplitStorageProviders,
 } from './storage/providers.js';
+import {
+  evaluateSplitStorageMigration,
+  stampSplitStorageGeneration,
+} from './storage/split-storage-state.js';
 import { resolveStorageConfig } from './storage/config.js';
 
 /**
@@ -1342,6 +1346,25 @@ export async function runFullAnalysis(
         runnerIdentityAtBootstrap,
         splitStorage,
       );
+    } catch (error) {
+      if (splitStorage) {
+        try {
+          const latestMeta = await loadMeta(writeTarget.metaDir);
+          if (
+            latestMeta?.splitStorage?.state === 'writing' &&
+            latestMeta.splitStorage.graphProvider === splitStorage.identity.graph &&
+            latestMeta.splitStorage.vectorProvider === splitStorage.identity.vector
+          ) {
+            await saveMeta(
+              writeTarget.metaDir,
+              stampSplitStorageGeneration(latestMeta, splitStorage.identity, 'failed'),
+            );
+          }
+        } catch {
+          // Keep the original analyze failure; the durable writing marker still blocks freshness.
+        }
+      }
+      throw error;
     } finally {
       await splitStorage?.close();
       discardScopedEmbeddingSpills();
@@ -1441,7 +1464,7 @@ async function runFullAnalysisInner(
   // saveMeta that spreads it (dirty flag, incremental phase stamps) advertises
   // "FTS disabled" instead of leftover available/build-failed while a wipe is
   // in flight. Re-enable leaves the prior stamp untouched.
-  const existingMeta = loadedMeta
+  let existingMeta = loadedMeta
     ? withExplicitFtsDisablement(loadedMeta, ftsDisabledReason)
     : undefined;
   // KTD6: the dying process writes nothing. Infer skip from the FTS-phase
@@ -2192,16 +2215,13 @@ async function runFullAnalysisInner(
     processDetectionBudget,
   );
 
-  // The split providers are derived stores, so an existing LadybugDB index
-  // cannot take the ordinary same-commit fast path on the first opt-in: the
-  // external graph/vector services may not contain anything yet. The
-  // successful split run stamps the graph capability below; later runs can
-  // safely use normal freshness checks for the same storage mode.
-  const splitStorageMigrationPending =
-    splitStorage !== undefined && existingMeta?.capabilities?.graph?.provider !== 'neo4j';
+  const splitStorageMigration = splitStorage
+    ? evaluateSplitStorageMigration(existingMeta?.splitStorage, splitStorage.identity)
+    : undefined;
+  const splitStorageMigrationPending = splitStorageMigration?.rebuild === true;
   if (splitStorageMigrationPending && !options.force) {
     log(
-      'Split storage was enabled after the existing index was built; forcing one rebuild to populate the external stores.',
+      `Split storage generation is missing, incomplete, or uses a different provider pair; rebuilding for ${splitStorage!.identity.graph} + ${splitStorage!.identity.vector}.`,
     );
     options = { ...options, force: true };
   }
@@ -2391,7 +2411,9 @@ async function runFullAnalysisInner(
         `Split storage is unavailable: ${unavailable.map((health) => health.message).join(' ')}`,
       );
     }
-    log('Split storage connected: Neo4j graph provider and PostgreSQL/pgvector vector provider.');
+    log(
+      `Split storage connected: ${splitStorage.identity.graph} graph provider and ${splitStorage.identity.vector} vector provider.`,
+    );
   }
 
   // ── Cache embeddings from existing index before rebuild ────────────
@@ -2435,9 +2457,20 @@ async function runFullAnalysisInner(
       existingEmbeddingCount = measured.count;
     } else {
       log(
-        `Warning: could not count PostgreSQL vectors (${measured.reason}); using saved metadata.`,
+        `Warning: could not count ${splitStorage.identity.vector} vectors (${measured.reason}); using saved metadata.`,
       );
     }
+  }
+  if (
+    splitStorageMigration?.resetVector &&
+    !options.dropEmbeddings &&
+    !options.embeddings &&
+    (existingMeta?.stats?.embeddings ?? 0) > 0
+  ) {
+    options = { ...options, embeddings: true };
+    log(
+      `Resetting the ${splitStorage!.identity.vector} vector generation; regenerating embeddings recorded by the previous index.`,
+    );
   }
   const {
     forceRegenerateEmbeddings,
@@ -2465,6 +2498,20 @@ async function runFullAnalysisInner(
         `Pass --embeddings to also generate embeddings for new/changed nodes, ` +
         `or --drop-embeddings to wipe them.`,
     );
+  }
+
+  if (splitStorage && storageScope) {
+    const writingBase: RepoMeta = existingMeta ?? {
+      repoPath,
+      storagePath,
+      lastCommit: '',
+      indexedAt: new Date().toISOString(),
+    };
+    existingMeta = stampSplitStorageGeneration(writingBase, splitStorage.identity, 'writing');
+    await saveMeta(metaDir, existingMeta);
+    if (splitStorageMigration?.resetVector || options.dropEmbeddings) {
+      await splitStorage.vector.deleteAllChunks(storageScope);
+    }
   }
 
   // We *always* load the embedding cache when one is requested (regardless
@@ -3909,9 +3956,6 @@ async function runFullAnalysisInner(
     // marked stale in the Phase 4 map so leftover chunks are deleted and rembedded.
     let restoredEmbeddingCount = 0;
     const restoreFailedNodeIds = new Set<string>();
-    if (splitStorage && storageScope && options.dropEmbeddings) {
-      await splitStorage.vector.deleteAllChunks(storageScope);
-    }
     if (cacheRowCount(cachedSnapshot) > 0) {
       const cachedDims = snapshotEmbeddingDims(cachedSnapshot);
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
@@ -4667,7 +4711,7 @@ async function runFullAnalysisInner(
       },
       capabilities: {
         graph: {
-          provider: splitStorage ? 'neo4j' : 'ladybugdb',
+          provider: splitStorage ? splitStorage.identity.graph : 'ladybugdb',
           status: splitStorage ? 'available' : runtimeCapabilities.graph,
         },
         // Reflect what this analyze run actually produced: when the FTS
@@ -4701,7 +4745,7 @@ async function runFullAnalysisInner(
           provider:
             effectiveSemanticMode === 'vector-index'
               ? splitStorage
-                ? 'postgresql-pgvector'
+                ? splitStorage.identity.vector
                 : 'ladybugdb-vector'
               : 'exact-scan',
           // Reads the MEASURED count, not `persistedEmbeddingCount` (#2790).
@@ -4722,6 +4766,15 @@ async function runFullAnalysisInner(
           reason: runtimeCapabilities.reason,
         },
       },
+      ...(splitStorage
+        ? {
+            splitStorage: {
+              state: 'ready' as const,
+              graphProvider: splitStorage.identity.graph,
+              vectorProvider: splitStorage.identity.vector,
+            },
+          }
+        : {}),
       // Incremental-indexing fields. Populated for git repos so the next
       // analyze run can take the incremental DB-writeback path. Setting
       // incrementalInProgress to undefined explicitly clears any prior

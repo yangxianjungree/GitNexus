@@ -227,6 +227,15 @@ export interface RepoMeta {
     };
   };
   /**
+   * Receipt for the external graph/vector generation used by split storage.
+   * Optional for indexes created before split storage tracked provider identity.
+   */
+  splitStorage?: {
+    state: 'not-started' | 'writing' | 'ready' | 'failed';
+    graphProvider: string;
+    vectorProvider: string;
+  };
+  /**
    * Digest of the graph DDL this index's tables were actually created from
    * (`SCHEMA_FINGERPRINT`, core/lbug/schema.ts). On mismatch, runFullAnalysis
    * warns and forces a full rebuild, which wipes and recreates the database so

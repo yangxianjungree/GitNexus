@@ -1,10 +1,22 @@
 import { describe, expect, it } from 'vitest';
+import { MongoClient } from 'mongodb';
 import { createStorageScope, deterministicChunkId } from '../../../src/core/storage/contracts.js';
 import {
   resolveStorageConfig,
   storageConfigDiagnostics,
 } from '../../../src/core/storage/config.js';
-import { isSplitStorageEnabled } from '../../../src/core/storage/providers.js';
+import {
+  createSplitStorageProviders,
+  isSplitStorageEnabled,
+  registerGraphStoreProvider,
+  registerVectorStoreProvider,
+} from '../../../src/core/storage/providers.js';
+import type { GraphStore, VectorStore } from '../../../src/core/storage/contracts.js';
+import {
+  evaluateSplitStorageMigration,
+  stampSplitStorageGeneration,
+} from '../../../src/core/storage/split-storage-state.js';
+import type { RepoMeta } from '../../../src/storage/repo-meta.js';
 
 describe('split storage contracts', () => {
   it('requires a repository and branch scope for every storage operation', () => {
@@ -95,5 +107,197 @@ describe('split storage contracts', () => {
     expect(diagnostics).toContain('vector.local:27017');
     expect(diagnostics).not.toContain('graph-secret');
     expect(diagnostics).not.toContain('vector-secret');
+  });
+
+  it('registers additional providers without adding selection branches', async () => {
+    const graph = {
+      queryCapabilities: { gitnexusCypher: 'v1', rawQueryLanguage: 'custom-cypher' },
+      query: async () => [],
+      close: async () => {},
+    } as unknown as GraphStore & {
+      queryCapabilities: { gitnexusCypher: 'v1'; rawQueryLanguage: string };
+      close(): Promise<void>;
+    };
+    const vector = { close: async () => {} } as unknown as VectorStore & {
+      close(): Promise<void>;
+    };
+    const unregisterGraph = registerGraphStoreProvider('custom-graph', (config) => {
+      expect(config.options).toEqual({ cluster: 'east' });
+      return graph;
+    });
+    const unregisterVector = registerVectorStoreProvider('custom-vector', (config) => {
+      expect(config.options).toEqual({ index: 'embeddings-v2' });
+      return vector;
+    });
+
+    try {
+      const config = resolveStorageConfig({
+        GITNEXUS_GRAPH_PROVIDER: 'custom-graph',
+        GITNEXUS_GRAPH_URI: 'custom+tcp://graph-user:graph-secret@graph.local:7610',
+        GITNEXUS_GRAPH_OPTIONS: '{"cluster":"east"}',
+        GITNEXUS_VECTOR_PROVIDER: 'custom-vector',
+        GITNEXUS_VECTOR_URI: 'custom+tcp://vector-user:vector-secret@vector.local:7810',
+        GITNEXUS_VECTOR_OPTIONS: '{"index":"embeddings-v2"}',
+      });
+      const diagnostics = JSON.stringify(storageConfigDiagnostics(config));
+      expect(diagnostics).not.toContain('graph-secret');
+      expect(diagnostics).not.toContain('vector-secret');
+      expect(diagnostics).not.toContain('east');
+      expect(diagnostics).not.toContain('embeddings-v2');
+
+      const providers = createSplitStorageProviders(config, { dimensions: 3 });
+      expect(providers.identity).toEqual({ graph: 'custom-graph', vector: 'custom-vector' });
+      expect(providers.graph).toBe(graph);
+      expect(providers.vector).toBe(vector);
+      await providers.close();
+    } finally {
+      unregisterVector();
+      unregisterGraph();
+    }
+  });
+
+  it('rejects graph adapters that do not declare the GitNexus query capability', () => {
+    const graph = { close: async () => {} } as unknown as GraphStore & {
+      close(): Promise<void>;
+    };
+    const unregisterGraph = registerGraphStoreProvider('raw-query-missing', () => graph);
+
+    try {
+      const config = resolveStorageConfig({
+        GITNEXUS_GRAPH_PROVIDER: 'raw-query-missing',
+        GITNEXUS_GRAPH_URI: 'custom+tcp://graph.local:7610',
+        GITNEXUS_VECTOR_PROVIDER: 'postgresql',
+        GITNEXUS_PGVECTOR_URL: 'postgresql://vector.local/gitnexus',
+      });
+
+      expect(() => createSplitStorageProviders(config, { dimensions: 3 })).toThrow(
+        /raw-query-missing.*gitnexus-cypher-v1/i,
+      );
+    } finally {
+      unregisterGraph();
+    }
+  });
+
+  it('rejects unregistered provider IDs and malformed provider options', () => {
+    expect(() =>
+      resolveStorageConfig({
+        GITNEXUS_GRAPH_PROVIDER: 'missing-graph',
+        GITNEXUS_GRAPH_URI: 'custom+tcp://graph.local:7610',
+      }),
+    ).toThrow(/not registered/i);
+
+    const register = registerVectorStoreProvider('bad-options-test', () => {
+      throw new Error('factory should not run');
+    });
+    try {
+      expect(() =>
+        resolveStorageConfig({
+          GITNEXUS_GRAPH_PROVIDER: 'neo4j',
+          GITNEXUS_NEO4J_URI: 'neo4j://graph.local:7687',
+          GITNEXUS_NEO4J_USERNAME: 'neo4j',
+          GITNEXUS_NEO4J_PASSWORD: 'secret',
+          GITNEXUS_VECTOR_PROVIDER: 'bad-options-test',
+          GITNEXUS_VECTOR_URI: 'custom+tcp://vector.local:7810',
+          GITNEXUS_VECTOR_OPTIONS: '[]',
+        }),
+      ).toThrow(/JSON object/i);
+    } finally {
+      register();
+    }
+  });
+
+  it('preserves driver-native Neo4j routing and MongoDB replica and mongos seed lists', async () => {
+    const config = resolveStorageConfig({
+      GITNEXUS_NEO4J_URI: 'neo4j://router.local:7687',
+      GITNEXUS_NEO4J_USERNAME: 'neo4j',
+      GITNEXUS_NEO4J_PASSWORD: 'secret',
+      GITNEXUS_VECTOR_PROVIDER: 'mongodb',
+      GITNEXUS_MONGODB_URL:
+        'mongodb://mongo-a.local:27017,mongo-b.local:27017/gitnexus?replicaSet=rs0',
+    });
+    const replicaClient = new MongoClient(config.vector.url);
+    const mongosConfig = resolveStorageConfig({
+      GITNEXUS_NEO4J_URI: 'neo4j://router.local:7687',
+      GITNEXUS_NEO4J_USERNAME: 'neo4j',
+      GITNEXUS_NEO4J_PASSWORD: 'secret',
+      GITNEXUS_VECTOR_PROVIDER: 'mongodb',
+      GITNEXUS_MONGODB_URL: 'mongodb://mongos-a.local:27017,mongos-b.local:27017/gitnexus',
+    });
+    const mongosClient = new MongoClient(mongosConfig.vector.url);
+    try {
+      expect(config.graph.uri).toBe('neo4j://router.local:7687');
+      expect(replicaClient.options.replicaSet).toBe('rs0');
+      expect(replicaClient.options.hosts.map((host) => host.toString())).toEqual([
+        'mongo-a.local:27017',
+        'mongo-b.local:27017',
+      ]);
+      expect(replicaClient.options.directConnection).toBe(false);
+      expect(mongosClient.options.replicaSet).toBeUndefined();
+      expect(mongosClient.options.hosts.map((host) => host.toString())).toEqual([
+        'mongos-a.local:27017',
+        'mongos-b.local:27017',
+      ]);
+      expect(mongosClient.options.directConnection).toBe(false);
+    } finally {
+      await Promise.all([replicaClient.close(), mongosClient.close()]);
+    }
+  });
+
+  it('forces recovery when provider identity changes or generation is not ready', () => {
+    const identity = { graph: 'neo4j', vector: 'postgresql' };
+    const ready = {
+      state: 'ready',
+      graphProvider: 'neo4j',
+      vectorProvider: 'postgresql',
+    } as const;
+
+    expect(evaluateSplitStorageMigration(ready, identity)).toEqual({
+      rebuild: false,
+      resetVector: false,
+      graphProviderChanged: false,
+      vectorProviderChanged: false,
+    });
+    expect(
+      evaluateSplitStorageMigration(ready, { graph: 'tugraph', vector: 'postgresql' }),
+    ).toEqual({
+      rebuild: true,
+      resetVector: false,
+      graphProviderChanged: true,
+      vectorProviderChanged: false,
+    });
+    expect(evaluateSplitStorageMigration(ready, { graph: 'neo4j', vector: 'mongodb' })).toEqual({
+      rebuild: true,
+      resetVector: true,
+      graphProviderChanged: false,
+      vectorProviderChanged: true,
+    });
+    expect(evaluateSplitStorageMigration({ ...ready, state: 'writing' }, identity)).toMatchObject({
+      rebuild: true,
+      resetVector: true,
+    });
+    expect(evaluateSplitStorageMigration(undefined, identity)).toMatchObject({
+      rebuild: true,
+      resetVector: true,
+    });
+  });
+
+  it('clears commit freshness until a split generation is ready', () => {
+    const meta = {
+      repoPath: '/repo',
+      lastCommit: 'abc123',
+      indexedAt: '2026-10-07T00:00:00.000Z',
+    } satisfies RepoMeta;
+    const identity = { graph: 'tugraph', vector: 'mongodb' };
+
+    const writing = stampSplitStorageGeneration(meta, identity, 'writing');
+    expect(writing.lastCommit).toBe('');
+    expect(writing.splitStorage).toEqual({
+      state: 'writing',
+      graphProvider: 'tugraph',
+      vectorProvider: 'mongodb',
+    });
+    expect(stampSplitStorageGeneration(writing, identity, 'failed').lastCommit).toBe('');
+    expect(stampSplitStorageGeneration(writing, identity, 'ready').lastCommit).toBe('');
+    expect(stampSplitStorageGeneration(meta, identity, 'ready').lastCommit).toBe('abc123');
   });
 });

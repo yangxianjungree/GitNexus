@@ -97,13 +97,13 @@ import {
 } from '../../core/storage/providers.js';
 import {
   createStorageScope,
-  type GraphStore,
+  type RawGraphQueryStore,
   type StorageScope,
 } from '../../core/storage/contracts.js';
 import { resolveStorageConfig } from '../../core/storage/config.js';
 
 interface SplitGraphRoute {
-  readonly store: GraphStore;
+  readonly store: RawGraphQueryStore;
   readonly scope: StorageScope;
 }
 

@@ -47,6 +47,11 @@ describe.skipIf(!enabled)('alternative graph and vector services', () => {
     };
 
     try {
+      expect(providers.identity).toEqual({ graph: 'tugraph', vector: 'mongodb' });
+      expect(providers.graph.queryCapabilities).toEqual({
+        gitnexusCypher: 'v1',
+        rawQueryLanguage: 'tugraph-opencypher',
+      });
       await expect(providers.graph.health()).resolves.toMatchObject({
         provider: 'tugraph',
         status: 'available',

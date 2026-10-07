@@ -78,8 +78,8 @@ export interface TextSearchHit {
 
 export type StoreHealthStatus = 'available' | 'degraded' | 'unavailable';
 
-export type GraphProviderName = 'neo4j' | 'tugraph';
-export type VectorProviderName = 'postgresql' | 'mongodb';
+export type GraphProviderName = string;
+export type VectorProviderName = string;
 
 export interface StoreHealth {
   readonly provider: GraphProviderName | VectorProviderName;
@@ -93,11 +93,6 @@ export type IndexGenerationState = 'not-started' | 'writing' | 'ready' | 'failed
 
 export interface GraphStore {
   health(): Promise<StoreHealth>;
-  query(
-    scope: StorageScope,
-    statement: string,
-    parameters?: Readonly<Record<string, unknown>>,
-  ): Promise<Readonly<Record<string, unknown>>[]>;
   upsertNodes(scope: StorageScope, nodes: readonly GraphNodeRecord[]): Promise<void>;
   upsertRelationships(
     scope: StorageScope,
@@ -107,6 +102,23 @@ export interface GraphStore {
   deleteAll(scope: StorageScope): Promise<void>;
   deleteNodes(scope: StorageScope, ids: readonly string[]): Promise<void>;
 }
+
+/** Raw query support is an explicit capability because its syntax is not portable. */
+export interface RawGraphQueryStore {
+  readonly queryCapabilities: {
+    /** Versioned query subset used by GitNexus core and the MCP `cypher` tool. */
+    readonly gitnexusCypher: 'v1';
+    /** Native dialect accepted by this adapter after its translation layer. */
+    readonly rawQueryLanguage: string;
+  };
+  query(
+    scope: StorageScope,
+    statement: string,
+    parameters?: Readonly<Record<string, unknown>>,
+  ): Promise<Readonly<Record<string, unknown>>[]>;
+}
+
+export type QueryableGraphStore = GraphStore & RawGraphQueryStore;
 
 export interface VectorStore {
   health(): Promise<StoreHealth>;

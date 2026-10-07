@@ -2,7 +2,7 @@ import {
   createStorageScope,
   type GraphNodeRecord,
   type GraphRelationshipRecord,
-  type GraphStore,
+  type QueryableGraphStore,
   type StorageScope,
   type StoreHealth,
 } from './contracts.js';
@@ -161,7 +161,12 @@ interface TuGraphResponse {
 }
 
 /** TuGraph adapter using its documented HTTP login and OpenCypher endpoints. */
-export class TuGraphGraphStore implements GraphStore {
+export class TuGraphGraphStore implements QueryableGraphStore {
+  readonly queryCapabilities = {
+    gitnexusCypher: 'v1',
+    rawQueryLanguage: 'tugraph-opencypher',
+  } as const;
+
   private readonly baseUrl: string;
   private readonly username: string;
   private readonly password: string;
