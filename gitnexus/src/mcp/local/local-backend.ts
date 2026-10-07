@@ -12,8 +12,8 @@ import { createHash } from 'crypto';
 import { scoreImpactRisk, unusedAxesForImpactWalk, type ImpactRiskResult } from 'gitnexus-shared';
 import {
   initLbug,
-  executeQuery,
-  executeParameterized,
+  executeQuery as executeLadybugQuery,
+  executeParameterized as executeLadybugParameterized,
   ensureVectorExtension,
   closeLbug,
   isLbugReady,
@@ -43,6 +43,7 @@ import {
   findGitRootByDotGit,
   getCanonicalRepoRoot,
   getGitRoot,
+  resolveRepoIdentityRoot,
 } from '../../storage/git.js';
 import { realpathSync } from 'fs';
 import {
@@ -84,10 +85,49 @@ import {
 // analyze side's comparator without pulling in the analyze pipeline, and this
 // module already takes a value import from `schema.ts`, so it costs nothing.
 import {
+  EMBEDDING_DIMS,
   EMBEDDING_TABLE_NAME,
   EMBEDDING_INDEX_NAME,
   embeddingDimsMismatch,
 } from '../../core/lbug/schema.js';
+import {
+  createSplitStorageProviders,
+  isSplitStorageEnabled,
+  type SplitStorageProviders,
+} from '../../core/storage/providers.js';
+import {
+  createStorageScope,
+  type GraphStore,
+  type StorageScope,
+} from '../../core/storage/contracts.js';
+import { resolveStorageConfig } from '../../core/storage/config.js';
+
+interface SplitGraphRoute {
+  readonly store: GraphStore;
+  readonly scope: StorageScope;
+}
+
+const splitGraphRoutes = new Map<string, SplitGraphRoute>();
+
+const executeQuery = async (lbugPath: string, statement: string): Promise<any[]> => {
+  const route = splitGraphRoutes.get(lbugPath);
+  if (route && statement.includes('$repoId') && statement.includes('$branchId')) {
+    return (await route.store.query(route.scope, statement)).map((row) => ({ ...row }));
+  }
+  return executeLadybugQuery(lbugPath, statement);
+};
+
+const executeParameterized = async (
+  lbugPath: string,
+  statement: string,
+  parameters: Record<string, unknown> = {},
+): Promise<any[]> => {
+  const route = splitGraphRoutes.get(lbugPath);
+  if (route && statement.includes('$repoId') && statement.includes('$branchId')) {
+    return (await route.store.query(route.scope, statement, parameters)).map((row) => ({ ...row }));
+  }
+  return executeLadybugParameterized(lbugPath, statement, parameters);
+};
 import { getExactScanLimit } from '../../core/platform/capabilities.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
 import { ftsDegradedWarning, ftsQueryFailedWarning } from '../../core/search/fts-indexes.js';
@@ -1660,6 +1700,8 @@ export class LocalBackend {
    * index write the same value and an entry never outlives the fact it records.
    */
   private lastQueryEmbeddingDims: Map<string, number> = new Map();
+  private splitStorage?: SplitStorageProviders;
+  private splitStoragePromise?: Promise<SplitStorageProviders>;
 
   /**
    * Cross-repo group tools (CLI). Shares logic with MCP `group_*` handlers.
@@ -1850,7 +1892,48 @@ export class LocalBackend {
 
   /** Close all pooled LadybugDB connections (CLI one-shot; optional for long-lived MCP). */
   async dispose(): Promise<void> {
-    await closeLbug();
+    try {
+      await closeLbug();
+    } finally {
+      const splitStorage = this.splitStorage;
+      this.splitStorage = undefined;
+      this.splitStoragePromise = undefined;
+      for (const [lbugPath, route] of splitGraphRoutes) {
+        if (route.store === splitStorage?.graph) splitGraphRoutes.delete(lbugPath);
+      }
+      await splitStorage?.close();
+    }
+  }
+
+  private async getSplitStorage(): Promise<SplitStorageProviders | undefined> {
+    if (!isSplitStorageEnabled()) return undefined;
+    this.splitStoragePromise ??= Promise.resolve().then(() =>
+      createSplitStorageProviders(resolveStorageConfig(), { dimensions: EMBEDDING_DIMS }),
+    );
+    try {
+      this.splitStorage = await this.splitStoragePromise;
+      return this.splitStorage;
+    } catch (error) {
+      this.splitStoragePromise = undefined;
+      throw error;
+    }
+  }
+
+  private splitStorageScope(repo: RepoHandle): StorageScope {
+    return createStorageScope(resolveRepoIdentityRoot(repo.repoPath), repo.branch ?? 'default');
+  }
+
+  private async registerSplitGraphRoute(
+    repo: RepoHandle,
+  ): Promise<SplitStorageProviders | undefined> {
+    const storage = await this.getSplitStorage();
+    if (storage) {
+      splitGraphRoutes.set(repo.lbugPath, {
+        store: storage.graph,
+        scope: this.splitStorageScope(repo),
+      });
+    }
+    return storage;
   }
 
   // ─── Initialization ──────────────────────────────────────────────
@@ -2504,6 +2587,7 @@ export class LocalBackend {
         indexedAt: repo.indexedAt,
         dbIdentity: await statDbIdentity(repo.lbugPath),
       });
+      await this.registerSplitGraphRoute(repo);
     } catch (err: any) {
       // If lock error, mark as not initialized so next call retries
       this.initializedRepos.delete(poolKey);
@@ -3864,6 +3948,71 @@ export class LocalBackend {
   /**
    * Semantic vector search helper
    */
+  private async semanticSearchSplit(
+    repo: RepoHandle,
+    query: string,
+    limit: number,
+  ): Promise<any[]> {
+    const storage = await this.registerSplitGraphRoute(repo);
+    if (!storage) return [];
+
+    const scope = this.splitStorageScope(repo);
+    const vectorCount = await storage.vector.countChunks(scope);
+    if (vectorCount === 0) {
+      this.lastQueryEmbeddingDims.delete(repo.lbugPath);
+      return [];
+    }
+
+    const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
+    const queryVec = await embedQuery(query);
+    const dims = getEmbeddingDims();
+    this.lastQueryEmbeddingDims.set(repo.lbugPath, dims);
+    const maxDistance = getVectorMaxDistance(DEFAULT_MCP_VECTOR_MAX_DISTANCE);
+    const hits = await storage.vector.searchNearest(scope, queryVec, {
+      // Fetch a small surplus because several adjacent chunks may belong to the
+      // same symbol; the final response remains capped at `limit` nodes.
+      limit: Math.max(limit, Math.min(limit * 4, 1000)),
+      maxDistance,
+    });
+
+    const bestChunks = new Map<
+      string,
+      { distance: number; chunkIndex: number; startLine: number; endLine: number }
+    >();
+    for (const hit of hits) {
+      const prior = bestChunks.get(hit.nodeId);
+      if (prior === undefined || hit.distance < prior.distance) {
+        bestChunks.set(hit.nodeId, {
+          distance: hit.distance,
+          chunkIndex: hit.chunkIndex,
+          startLine: hit.startLine,
+          endLine: hit.endLine,
+        });
+      }
+    }
+    if (bestChunks.size === 0) return [];
+
+    const nodes = await storage.graph.getNodesByIds(scope, [
+      ...Array.from(bestChunks.keys()).slice(0, limit),
+    ]);
+    const nodesById = new Map(nodes.map((node) => [node.id, node]));
+    const results: any[] = [];
+    for (const [nodeId, bestChunk] of Array.from(bestChunks.entries()).slice(0, limit)) {
+      const node = nodesById.get(nodeId);
+      if (!node) continue;
+      results.push({
+        nodeId,
+        name: node.properties.name ?? '',
+        type: node.label,
+        filePath: node.properties.filePath ?? '',
+        distance: bestChunk.distance,
+        startLine: bestChunk.startLine,
+        endLine: bestChunk.endLine,
+      });
+    }
+    return results;
+  }
+
   private async semanticSearch(
     repo: RepoHandle,
     query: string,
@@ -3875,6 +4024,9 @@ export class LocalBackend {
     // call's width, and the catch below must only clear an entry it did not set.
     let embeddedDims: number | undefined;
     try {
+      if (isSplitStorageEnabled()) {
+        return await this.semanticSearchSplit(repo, query, limit);
+      }
       // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
       // determinism: probe — aggregate singleton. COUNT(*) with no grouping key returns exactly one row, and only
       // the count is read, to decide whether to load the embedding model at all.

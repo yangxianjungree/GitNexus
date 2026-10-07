@@ -31,7 +31,7 @@ class FakeNeo4jSession {
         ],
       };
     }
-    if (text.includes('RETURN n.id AS id')) {
+    if (text.includes('RETURN n.id AS id') || text.includes('RETURN n.kind AS kind')) {
       return {
         records: [
           {
@@ -46,8 +46,15 @@ class FakeNeo4jSession {
                   kind: 'Function',
                   name: 'run',
                   filePath: 'src/a.ts',
+                  startLine: { toNumber: () => 3 },
                 },
               })[key],
+            toObject: () => ({
+              id: 'Function:src/a.ts:run',
+              name: 'run',
+              count: { toNumber: () => 7 },
+              nested: [{ toNumber: () => 2 }],
+            }),
           },
         ],
       };
@@ -146,6 +153,64 @@ describe('Neo4jGraphStore', () => {
     await store.close();
   });
 
+  it('runs parameterized graph reads inside the requested database and scope boundary', async () => {
+    const driver = new FakeNeo4jDriver();
+    const store = makeStore(driver);
+
+    const rows = await store.query(
+      scope,
+      'MATCH (n:Function {repoId: $repoId, branchId: $branchId}) RETURN n.id AS id',
+      { limit: 1 },
+    );
+
+    expect(rows).toEqual([expect.objectContaining({ id: 'Function:src/a.ts:run', name: 'run' })]);
+    const queryCall = driver.sessions
+      .flatMap((session) => session.calls)
+      .find((call) =>
+        call.text.includes('MATCH (n:Function {repoId: $repoId, branchId: $branchId})'),
+      );
+    expect(queryCall?.parameters).toEqual({
+      limit: 1,
+      repoId: 'repo-alpha',
+      branchId: 'feature/graph',
+    });
+    await store.close();
+  });
+
+  it('normalizes Neo4j integers and uses the persisted node kind for label projections', async () => {
+    const driver = new FakeNeo4jDriver();
+    const store = makeStore(driver);
+
+    const rows = await store.query(
+      scope,
+      `MATCH (n:Function {repoId: $repoId, branchId: $branchId})
+       RETURN labels(n)[0] AS kind, 1 AS count`,
+    );
+
+    const queryCall = driver.sessions
+      .flatMap((session) => session.calls)
+      .find((call) => call.text.includes('RETURN n.kind AS kind'));
+    expect(queryCall).toBeDefined();
+    expect(rows[0]).toMatchObject({
+      id: 'Function:src/a.ts:run',
+      name: 'run',
+      count: 7,
+      nested: [2],
+    });
+    await store.close();
+  });
+
+  it('rejects graph reads that do not declare repository and branch predicates', async () => {
+    const driver = new FakeNeo4jDriver();
+    const store = makeStore(driver);
+
+    await expect(store.query(scope, 'MATCH (n:Function) RETURN n.id AS id')).rejects.toThrow(
+      /repoId and \$branchId/,
+    );
+    expect(driver.sessions).toHaveLength(0);
+    await store.close();
+  });
+
   it('writes scoped relationships and hydrates nodes without storage metadata', async () => {
     const driver = new FakeNeo4jDriver();
     const store = makeStore(driver);
@@ -161,14 +226,30 @@ describe('Neo4jGraphStore', () => {
       repoId: 'repo-alpha',
       branchId: 'feature/graph',
     });
-    expect(relationshipWrite?.text).toContain('MERGE (source)-[r:`CALLS`');
+    expect(relationshipWrite?.text).toContain('MERGE (source)-[r:CodeRelation');
+    expect(relationshipWrite?.text).toContain('r.type = row.type');
+    expect(relationshipWrite?.parameters.rows).toEqual([
+      expect.objectContaining({ type: 'CALLS' }),
+    ]);
     expect(nodes).toEqual([
       {
         id: source.id,
         label: 'Function',
-        properties: { name: 'run', filePath: 'src/a.ts' },
+        properties: { name: 'run', filePath: 'src/a.ts', startLine: 3 },
       },
     ]);
+    await store.close();
+  });
+
+  it('deletes the complete repository and branch scope before a replacement write', async () => {
+    const driver = new FakeNeo4jDriver();
+    const store = makeStore(driver);
+
+    await store.deleteAll(scope);
+
+    const calls = driver.sessions.flatMap((session) => session.calls);
+    const deleteCall = calls.find((call) => call.text.includes('DETACH DELETE n'));
+    expect(deleteCall?.parameters).toEqual({ repoId: 'repo-alpha', branchId: 'feature/graph' });
     await store.close();
   });
 
@@ -178,7 +259,7 @@ describe('Neo4jGraphStore', () => {
     const store = makeStore(driver);
 
     await expect(store.upsertRelationships(scope, [relationship])).rejects.toThrow(
-      /stored 0 of 1 CALLS relationships/,
+      /stored 0 of 1 relationships/,
     );
 
     const relationshipSession = driver.sessions.at(-1);
@@ -196,7 +277,7 @@ describe('Neo4jGraphStore', () => {
     ).rejects.toThrow(/label/);
     await expect(
       store.upsertRelationships(scope, [{ ...relationship, type: 'CALLS] DELETE n //' }]),
-    ).rejects.toThrow(/type/);
+    ).rejects.toThrow(/relationship type/);
     await expect(
       store.deleteNodes({ repoId: 'repo-alpha', branchId: '' }, [source.id]),
     ).rejects.toThrow(/branchId/);

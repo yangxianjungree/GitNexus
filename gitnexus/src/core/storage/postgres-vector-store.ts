@@ -186,6 +186,15 @@ export class PostgresVectorStore implements VectorStore {
     );
   }
 
+  async deleteAllChunks(scope: StorageScope): Promise<void> {
+    scope = validateScope(scope);
+    await this.initialize();
+    await this.pool.query(`DELETE FROM ${this.table} WHERE repo_id = $1 AND branch_id = $2`, [
+      scope.repoId,
+      scope.branchId,
+    ]);
+  }
+
   async deleteChunksForNodes(scope: StorageScope, nodeIds: readonly string[]): Promise<void> {
     scope = validateScope(scope);
     if (nodeIds.length === 0) return;

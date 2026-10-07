@@ -90,18 +90,25 @@ export type IndexGenerationState = 'not-started' | 'writing' | 'ready' | 'failed
 
 export interface GraphStore {
   health(): Promise<StoreHealth>;
+  query(
+    scope: StorageScope,
+    statement: string,
+    parameters?: Readonly<Record<string, unknown>>,
+  ): Promise<Readonly<Record<string, unknown>>[]>;
   upsertNodes(scope: StorageScope, nodes: readonly GraphNodeRecord[]): Promise<void>;
   upsertRelationships(
     scope: StorageScope,
     relationships: readonly GraphRelationshipRecord[],
   ): Promise<void>;
   getNodesByIds(scope: StorageScope, ids: readonly string[]): Promise<GraphNodeRecord[]>;
+  deleteAll(scope: StorageScope): Promise<void>;
   deleteNodes(scope: StorageScope, ids: readonly string[]): Promise<void>;
 }
 
 export interface VectorStore {
   health(): Promise<StoreHealth>;
   upsertChunks(scope: StorageScope, chunks: readonly EmbeddingChunkRecord[]): Promise<void>;
+  deleteAllChunks(scope: StorageScope): Promise<void>;
   deleteChunks(scope: StorageScope, ids: readonly string[]): Promise<void>;
   deleteChunksForNodes(scope: StorageScope, nodeIds: readonly string[]): Promise<void>;
   getContentHashes(scope: StorageScope, nodeIds: readonly string[]): Promise<Map<string, string>>;

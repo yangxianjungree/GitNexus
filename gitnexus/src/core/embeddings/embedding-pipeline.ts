@@ -667,6 +667,16 @@ export const runEmbeddingPipeline = async (
     throwIfCancelled();
     const embeddableNodeIds = new Set(nodes.map((node) => node.id));
 
+    // Split storage does not restore embedding rows through LadybugDB. When the
+    // caller did not provide a cache-derived hash map, read the persisted hashes
+    // from the injected vector store so unchanged nodes can still be skipped.
+    let knownEmbeddings = existingEmbeddings;
+    if (!knownEmbeddings && vectorStoreContext && nodes.length > 0) {
+      knownEmbeddings = await vectorStoreContext.store.getContentHashes(vectorStoreContext.scope, [
+        ...embeddableNodeIds,
+      ]);
+    }
+
     // Incremental mode: compare content hashes, delete stale rows, skip fresh ones.
     // Computed hashes for stale nodes are cached so batchInsertEmbeddings can reuse them
     // (avoids double computation).
@@ -677,12 +687,12 @@ export const runEmbeddingPipeline = async (
     const staleNodeIds = new Set<string>();
     const forceReembedNodeIds = pipelineOptions.forceReembedNodeIds;
     if (
-      (existingEmbeddings && existingEmbeddings.size > 0) ||
+      (knownEmbeddings && knownEmbeddings.size > 0) ||
       (forceReembedNodeIds && forceReembedNodeIds.size > 0)
     ) {
       const beforeCount = nodes.length;
       nodes = nodes.filter((n) => {
-        const existingHash = existingEmbeddings?.get(n.id);
+        const existingHash = knownEmbeddings?.get(n.id);
         if (existingHash === undefined) {
           // New node — needs embedding
           return true;
@@ -700,7 +710,7 @@ export const runEmbeddingPipeline = async (
 
       if (isDev) {
         logger.info(
-          `📦 Incremental embeddings: ${beforeCount} total, ${existingEmbeddings.size} cached, ${staleNodeIds.size} stale, ${nodes.length} to embed`,
+          `📦 Incremental embeddings: ${beforeCount} total, ${knownEmbeddings?.size ?? 0} cached, ${staleNodeIds.size} stale, ${nodes.length} to embed`,
         );
       }
     }

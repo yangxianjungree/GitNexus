@@ -277,6 +277,7 @@ import {
   persistedEmbeddingCountOrUndefined,
   resolvePersistedEmbeddingCount,
 } from './embedding-count.js';
+import type { PersistedEmbeddingCount } from './embedding-count.js';
 import {
   EMBEDDING_RESUME_MAX_ATTEMPTS,
   decideEmbeddingResume,
@@ -285,6 +286,19 @@ import {
   mintUnverifiedCountCheckpoint,
 } from './embedding-checkpoint.js';
 import type { EmbeddingCheckpoint } from './embedding-checkpoint.js';
+import {
+  createStorageScope,
+  type GraphNodeRecord,
+  type GraphRelationshipRecord,
+  type StorageScope,
+  type VectorStore,
+} from './storage/contracts.js';
+import {
+  createSplitStorageProviders,
+  isSplitStorageEnabled,
+  type SplitStorageProviders,
+} from './storage/providers.js';
+import { resolveStorageConfig } from './storage/config.js';
 
 /**
  * Strip C0/C1 control characters from a progress/diagnostic message.
@@ -302,6 +316,68 @@ import type { EmbeddingCheckpoint } from './embedding-checkpoint.js';
  */
 const stripControlCharacters = (msg: string): string =>
   msg.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, '');
+
+const measureVectorStoreEmbeddingCount = async (
+  vectorStore: VectorStore,
+  scope: StorageScope,
+): Promise<PersistedEmbeddingCount> => {
+  try {
+    return { kind: 'measured', count: await vectorStore.countChunks(scope) };
+  } catch (err) {
+    return { kind: 'unknown', reason: err instanceof Error ? err.message : String(err) };
+  }
+};
+
+export const persistGraphToSplitStore = async (
+  graph: KnowledgeGraph,
+  scope: StorageScope,
+  graphStore: SplitStorageProviders['graph'],
+  log: (message: string) => void,
+): Promise<void> => {
+  const batchSize = 500;
+  await graphStore.deleteAll(scope);
+  let nodeBatch: GraphNodeRecord[] = [];
+  for (const node of graph.iterNodes()) {
+    nodeBatch.push({ id: node.id, label: node.label, properties: node.properties });
+    if (nodeBatch.length === batchSize) {
+      await graphStore.upsertNodes(scope, nodeBatch);
+      nodeBatch = [];
+    }
+  }
+  if (nodeBatch.length > 0) await graphStore.upsertNodes(scope, nodeBatch);
+
+  let relationshipBatch: GraphRelationshipRecord[] = [];
+  for (const relationship of graph.iterRelationships()) {
+    relationshipBatch.push({
+      id: relationship.id,
+      sourceId: relationship.sourceId,
+      targetId: relationship.targetId,
+      type: relationship.type,
+      properties: {
+        confidence: relationship.confidence,
+        reason: relationship.reason,
+        ...(relationship.step === undefined ? {} : { step: relationship.step }),
+        ...(relationship.staticGated === undefined
+          ? {}
+          : { staticGated: relationship.staticGated }),
+        ...(relationship.evidence === undefined
+          ? {}
+          : { evidence: JSON.stringify(relationship.evidence) }),
+      },
+    });
+    if (relationshipBatch.length === batchSize) {
+      await graphStore.upsertRelationships(scope, relationshipBatch);
+      relationshipBatch = [];
+    }
+  }
+  if (relationshipBatch.length > 0) {
+    await graphStore.upsertRelationships(scope, relationshipBatch);
+  }
+  log(
+    `Split graph store replaced ${graph.nodeCount.toLocaleString()} nodes and ` +
+      `${graph.relationshipCount.toLocaleString()} relationships for this repository/branch.`,
+  );
+};
 
 interface PersistedFrameworkAnnotationRow {
   readonly id?: unknown;
@@ -1204,7 +1280,11 @@ export async function runFullAnalysis(
   let writeTarget = await resolveWriteTarget(repoPath, options);
   let lock = await acquireIndexLock(writeTarget.metaDir, acquireOpts);
   return withEmbeddingSpillScope(async () => {
+    let splitStorage: SplitStorageProviders | undefined;
     try {
+      splitStorage = isSplitStorageEnabled()
+        ? createSplitStorageProviders(resolveStorageConfig(), { dimensions: EMBEDDING_DIMS })
+        : undefined;
       requireExclusiveIndexLock(
         lock,
         `Cannot acquire the index lock at ${writeTarget.metaDir}; refusing an unlocked analysis.`,
@@ -1260,8 +1340,10 @@ export async function runFullAnalysis(
         writeTarget,
         contentRetention,
         runnerIdentityAtBootstrap,
+        splitStorage,
       );
     } finally {
+      await splitStorage?.close();
       discardScopedEmbeddingSpills();
       lock.release();
     }
@@ -1275,6 +1357,7 @@ async function runFullAnalysisInner(
   writeTarget: WriteTarget,
   contentRetention: ContentRetention,
   runnerIdentityAtBootstrap?: AnalyzerRunnerIdentity,
+  splitStorage?: SplitStorageProviders,
 ): Promise<AnalyzeResult> {
   const ftsDisabledReason = resolveFtsDisableReason(options.skipFts);
   const initAnalysisLbug = (dbPath: string) =>
@@ -2109,6 +2192,20 @@ async function runFullAnalysisInner(
     processDetectionBudget,
   );
 
+  // The split providers are derived stores, so an existing LadybugDB index
+  // cannot take the ordinary same-commit fast path on the first opt-in: the
+  // external graph/vector services may not contain anything yet. The
+  // successful split run stamps the graph capability below; later runs can
+  // safely use normal freshness checks for the same storage mode.
+  const splitStorageMigrationPending =
+    splitStorage !== undefined && existingMeta?.capabilities?.graph?.provider !== 'neo4j';
+  if (splitStorageMigrationPending && !options.force) {
+    log(
+      'Split storage was enabled after the existing index was built; forcing one rebuild to populate the external stores.',
+    );
+    options = { ...options, force: true };
+  }
+
   // ── Early-return: already up to date ──────────────────────────────
   if (
     existingMeta &&
@@ -2281,6 +2378,22 @@ async function runFullAnalysisInner(
 
   await ensureWritableStorage();
 
+  if (splitStorage) {
+    const [graphHealth, vectorHealth] = await Promise.all([
+      splitStorage.graph.health(),
+      splitStorage.vector.health(),
+    ]);
+    const unavailable = [graphHealth, vectorHealth].filter(
+      (health) => health.status !== 'available',
+    );
+    if (unavailable.length > 0) {
+      throw new Error(
+        `Split storage is unavailable: ${unavailable.map((health) => health.message).join(' ')}`,
+      );
+    }
+    log('Split storage connected: Neo4j graph provider and PostgreSQL/pgvector vector provider.');
+  }
+
   // ── Cache embeddings from existing index before rebuild ────────────
   // Four modes:
   //   --embeddings              -> load cache, restore, then generate any new ones
@@ -2309,7 +2422,23 @@ async function runFullAnalysisInner(
     cachedSnapshot = { ...cachedSnapshot, spill: undefined };
   };
 
-  const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
+  const storageScope = splitStorage
+    ? createStorageScope(
+        path.resolve(resolveRepoIdentityRoot(repoPath)),
+        branchLabel ?? existingMeta?.branch ?? 'default',
+      )
+    : undefined;
+  let existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
+  if (splitStorage && storageScope) {
+    const measured = await measureVectorStoreEmbeddingCount(splitStorage.vector, storageScope);
+    if (measured.kind === 'measured') {
+      existingEmbeddingCount = measured.count;
+    } else {
+      log(
+        `Warning: could not count PostgreSQL vectors (${measured.reason}); using saved metadata.`,
+      );
+    }
+  }
   const {
     forceRegenerateEmbeddings,
     preserveExistingEmbeddings,
@@ -2352,7 +2481,7 @@ async function runFullAnalysisInner(
   // moved (or removed) the crashed run's WAL/shadow; when neither was
   // possible the dirty block above already threw a LbugWipeError, so this
   // open is replay-free by construction (FIX 1 of this shipping review).
-  if (shouldLoadCache && existingMeta) {
+  if (shouldLoadCache && existingMeta && !isSplitStorageEnabled()) {
     try {
       progress('embeddings', 0, 'Caching embeddings...');
       await initAnalysisLbug(lbugPath);
@@ -2374,6 +2503,8 @@ async function runFullAnalysisInner(
         /* swallow */
       }
     }
+  } else if (shouldLoadCache && existingMeta && isSplitStorageEnabled()) {
+    log('Split storage is enabled; embedding rows will be read from PostgreSQL/pgvector.');
   }
 
   // ── Load incremental parse cache ──────────────────────────────────
@@ -2404,7 +2535,11 @@ async function runFullAnalysisInner(
   // (The post-pipeline analysis-feature re-check can also set `force`, but the
   // pipeline has already run by then; that run emits non-streamed, precisely as
   // `resolveStreamPdgEmit` — read fresh at the same point — behaves.)
-  const streamGraphEmitActive = resolveStreamGraphEmit(options);
+  // The split graph provider receives the in-memory graph in this slice. A
+  // streamed run keeps structural edges in CSV files, so enabling it here
+  // would publish an incomplete Neo4j graph; defer streaming until the CSV
+  // manifest has a provider-neutral reader.
+  const streamGraphEmitActive = splitStorage ? false : resolveStreamGraphEmit(options);
 
   // #3016: hold back Leiden and flow extraction when the persisted metadata
   // says this run is a candidate for a surgical incremental write, whose
@@ -3570,6 +3705,10 @@ async function runFullAnalysisInner(
       );
     }
 
+    if (splitStorage && storageScope) {
+      await persistGraphToSplitStore(pipelineResult.graph, storageScope, splitStorage.graph, log);
+    }
+
     // Converged graph-boundary drain: incremental used to checkpoint here;
     // full rebuild did not. One site so FTS always starts after a settled
     // plan (post-escalation `buildPath`) and a recorded checkpoint outcome.
@@ -3770,6 +3909,9 @@ async function runFullAnalysisInner(
     // marked stale in the Phase 4 map so leftover chunks are deleted and rembedded.
     let restoredEmbeddingCount = 0;
     const restoreFailedNodeIds = new Set<string>();
+    if (splitStorage && storageScope && options.dropEmbeddings) {
+      await splitStorage.vector.deleteAllChunks(storageScope);
+    }
     if (cacheRowCount(cachedSnapshot) > 0) {
       const cachedDims = snapshotEmbeddingDims(cachedSnapshot);
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
@@ -3816,7 +3958,13 @@ async function runFullAnalysisInner(
               continue;
             }
             try {
-              await batchInsert(executeWithReusedStatement, materialized);
+              await batchInsert(
+                executeWithReusedStatement,
+                materialized,
+                splitStorage && storageScope
+                  ? { vectorStore: splitStorage.vector, storageScope }
+                  : undefined,
+              );
               restoredEmbeddingCount += batch.length;
             } catch (err) {
               for (const row of batch) restoreFailedNodeIds.add(row.nodeId);
@@ -4097,7 +4245,7 @@ async function runFullAnalysisInner(
     // reflects the DB's ACTUAL state even when recreation fails (extension
     // unavailable → 'exact-scan').
     const dbWasWiped = !isIncremental || escalatedFullWrite;
-    if (restoredEmbeddingCount > 0 && dbWasWiped && embeddingSkipped) {
+    if (restoredEmbeddingCount > 0 && dbWasWiped && embeddingSkipped && !splitStorage) {
       // Re-import at the seam rather than thread a mutable capture from
       // Phase 3.5 (FIX 3 of this shipping review — the captured function was
       // a fragile moving part): dynamic imports are memoized, and
@@ -4215,6 +4363,9 @@ async function runFullAnalysisInner(
         existingEmbeddings,
         {
           forceReembedNodeIds: pendingEmbeddingNodeIds,
+          ...(splitStorage && storageScope
+            ? { vectorStore: splitStorage.vector, storageScope }
+            : {}),
           onCheckpointWindowStart: async ({ nodeIds, ...checkpoint }) => {
             await saveEmbeddingCheckpoint(checkpoint, nodeIds);
           },
@@ -4231,7 +4382,10 @@ async function runFullAnalysisInner(
           // with whatever count is already on disk left alone.
           onCheckpoint: async (checkpoint) => {
             await checkpointOnce();
-            const measured = await measurePersistedEmbeddingCount(executeQuery);
+            const measured =
+              splitStorage && storageScope
+                ? await measureVectorStoreEmbeddingCount(splitStorage.vector, storageScope)
+                : await measurePersistedEmbeddingCount(executeQuery);
             if (measured.kind === 'unknown') {
               log(
                 `Warning: could not measure persisted embeddings at the embedding checkpoint ` +
@@ -4285,7 +4439,10 @@ async function runFullAnalysisInner(
     // embedding-count.ts. What that buys HERE: the old silent `catch {}` left
     // "cannot ask" indistinguishable from "wrote nothing", so a diagnostic
     // failure crashed the run at the gate below with no clue why.
-    const measuredEmbeddingCount = await measurePersistedEmbeddingCount(executeQuery);
+    const measuredEmbeddingCount =
+      splitStorage && storageScope
+        ? await measureVectorStoreEmbeddingCount(splitStorage.vector, storageScope)
+        : await measurePersistedEmbeddingCount(executeQuery);
     const embeddingCount = persistedEmbeddingCountOrUndefined(measuredEmbeddingCount);
     if (measuredEmbeddingCount.kind === 'unknown') {
       // Not silent any more: the operator gets the reason the count is unknown.
@@ -4509,7 +4666,10 @@ async function runFullAnalysisInner(
         embeddings: persistedEmbeddingCount,
       },
       capabilities: {
-        graph: { provider: 'ladybugdb', status: runtimeCapabilities.graph },
+        graph: {
+          provider: splitStorage ? 'neo4j' : 'ladybugdb',
+          status: splitStorage ? 'available' : runtimeCapabilities.graph,
+        },
         // Reflect what this analyze run actually produced: when the FTS
         // extension was unavailable the indexes were skipped, so record
         // 'unavailable' rather than the static runtime default. Keeps
@@ -4538,7 +4698,12 @@ async function runFullAnalysisInner(
             : {}),
         },
         vectorSearch: {
-          provider: effectiveSemanticMode === 'vector-index' ? 'ladybugdb-vector' : 'exact-scan',
+          provider:
+            effectiveSemanticMode === 'vector-index'
+              ? splitStorage
+                ? 'postgresql-pgvector'
+                : 'ladybugdb-vector'
+              : 'exact-scan',
           // Reads the MEASURED count, not `persistedEmbeddingCount` (#2790).
           // The carry-forward exists so a later `--force` doesn't discard a
           // live cache — it is a guess, and a guess must never certify the

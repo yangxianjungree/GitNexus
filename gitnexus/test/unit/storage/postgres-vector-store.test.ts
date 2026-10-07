@@ -127,6 +127,19 @@ describe('PostgresVectorStore', () => {
     await store.close();
   });
 
+  it('deletes all vectors only within the requested repository and branch', async () => {
+    const pool = new FakePostgresPool();
+    const store = makeStore(pool);
+
+    await store.deleteAllChunks(scope);
+
+    expect(pool.directCalls.at(-1)?.text).toMatch(
+      /DELETE FROM .*gitnexus_embedding_chunks.*WHERE repo_id = \$1 AND branch_id = \$2/,
+    );
+    expect(pool.directCalls.at(-1)?.values).toEqual(['repo-alpha', 'feature/vector']);
+    await store.close();
+  });
+
   it('rejects a chunk identity or vector width that does not match the store contract', async () => {
     const pool = new FakePostgresPool();
     const store = makeStore(pool);

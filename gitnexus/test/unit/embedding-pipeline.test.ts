@@ -384,6 +384,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       upsertChunks: vi.fn(async (_scope, chunks) => {
         store.upserted.push(...chunks);
       }),
+      deleteAllChunks: vi.fn().mockResolvedValue(undefined),
       deleteChunks: vi.fn().mockResolvedValue(undefined),
       deleteChunksForNodes: vi.fn(async (scope, nodeIds) => {
         store.deletedNodeScopes.push({ scope, nodeIds: [...nodeIds] });
@@ -506,6 +507,38 @@ describe('runEmbeddingPipeline incremental filter', () => {
     });
     expect(stmtCalls.some((call) => call.cypher.includes('CREATE'))).toBe(false);
     expect(vectorIndexMock).not.toHaveBeenCalled();
+  });
+
+  it('loads existing content hashes from an injected VectorStore when no cache map is supplied', async () => {
+    mockEmbedderSetup();
+
+    const node = makeNode();
+    const vectorStore = makeVectorStore();
+    const hash = contentHashForNode(node, DEFAULT_EMBEDDING_CONFIG);
+    vi.mocked(vectorStore.getContentHashes).mockResolvedValue(new Map([[node.id, hash]]));
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    const result = await runEmbeddingPipeline(
+      mockExecuteQuery([node]),
+      mockExecuteWithReusedStatement(),
+      onProgress,
+      {},
+      undefined,
+      undefined,
+      {
+        vectorStore,
+        storageScope: { repoId: 'repo-alpha', branchId: 'feature/vector' },
+      },
+    );
+
+    expect(vectorStore.getContentHashes).toHaveBeenCalledWith(
+      { repoId: 'repo-alpha', branchId: 'feature/vector' },
+      [node.id],
+    );
+    expect(vectorStore.upserted).toHaveLength(0);
+    expect(result.nodesProcessed).toBe(0);
   });
 
   it('requires a repository and branch scope when a VectorStore is injected', async () => {

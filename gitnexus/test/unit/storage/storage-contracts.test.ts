@@ -4,6 +4,7 @@ import {
   resolveStorageConfig,
   storageConfigDiagnostics,
 } from '../../../src/core/storage/config.js';
+import { isSplitStorageEnabled } from '../../../src/core/storage/providers.js';
 
 describe('split storage contracts', () => {
   it('requires a repository and branch scope for every storage operation', () => {
@@ -63,5 +64,11 @@ describe('split storage contracts', () => {
     expect(diagnostics).not.toContain('vector-secret');
     expect(diagnostics).not.toContain('graph-user');
     expect(diagnostics).not.toContain('vector-user');
+  });
+
+  it('requires an explicit split-storage opt-in', () => {
+    expect(isSplitStorageEnabled({})).toBe(false);
+    expect(isSplitStorageEnabled({ GITNEXUS_STORAGE_MODE: 'ladybug' })).toBe(false);
+    expect(isSplitStorageEnabled({ GITNEXUS_STORAGE_MODE: ' SPLIT ' })).toBe(true);
   });
 });
